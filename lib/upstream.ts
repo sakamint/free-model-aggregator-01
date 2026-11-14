@@ -212,16 +212,26 @@ function jsonOrNull(text: string): Record<string, unknown> | null {
   }
 }
 
-function usageOf(value: Record<string, unknown>): { input: number; output: number } | null {
+/**
+ * The usage of one frame or body. A frame may carry only one side — an Anthropic stream
+ * reports its input tokens in message_start and its output tokens in message_delta — so
+ * either field may be null and the caller merges frames until both are known.
+ */
+export interface PartialUsage {
+  input: number | null;
+  output: number | null;
+}
+
+function usageOf(value: Record<string, unknown>): PartialUsage | null {
   if (!isRecord(value.usage)) return null;
   const input = numberOrNull(value.usage.prompt_tokens) ?? numberOrNull(value.usage.input_tokens);
   const output = numberOrNull(value.usage.completion_tokens) ?? numberOrNull(value.usage.output_tokens);
-  if (input === null || output === null) return null;
+  if (input === null && output === null) return null;
   return { input, output };
 }
 
 /** The answer text of an OpenAI JSON body or stream chunk: the message content, or a delta. */
-function openAIText(value: Record<string, unknown>): { text: string; stop: string | null; usage: { input: number; output: number } | null } {
+function openAIText(value: Record<string, unknown>): { text: string; stop: string | null; usage: PartialUsage | null } {
   const usage = usageOf(value);
   const choices = Array.isArray(value.choices) ? value.choices : [];
   const choice = choices.length > 0 && isRecord(choices[0]) ? choices[0] : null;
@@ -234,7 +244,7 @@ function openAIText(value: Record<string, unknown>): { text: string; stop: strin
 }
 
 /** The answer text of an Anthropic JSON body or stream event. */
-function anthropicText(value: Record<string, unknown>): { text: string; stop: string | null; usage: { input: number; output: number } | null } {
+function anthropicText(value: Record<string, unknown>): { text: string; stop: string | null; usage: PartialUsage | null } {
   if (isRecord(value.message) && isRecord(value.message.usage)) {
     return { text: '', stop: null, usage: usageOf({ usage: value.message.usage }) };
   }
@@ -254,7 +264,7 @@ function anthropicText(value: Record<string, unknown>): { text: string; stop: st
 }
 
 /** The answer text of a Gemini JSON body or stream frame. */
-function geminiText(value: Record<string, unknown>): { text: string; stop: string | null; usage: { input: number; output: number } | null } {
+function geminiText(value: Record<string, unknown>): { text: string; stop: string | null; usage: PartialUsage | null } {
   const candidates = Array.isArray(value.candidates) ? value.candidates : [];
   const candidate = candidates.length > 0 && isRecord(candidates[0]) ? candidates[0] : null;
   let text = '';
@@ -277,14 +287,23 @@ async function readUpstream(res: Response, wire: 'openai' | 'anthropic' | 'gemin
   const bodyText = await res.text();
   if (!res.ok) return { ok: false, status: res.status, error: bodyText.slice(0, 500) };
   let text = '';
-  let usage: { input: number; output: number } | null = null;
+  // The two usage numbers may arrive in different frames (an Anthropic stream reports its
+  // input in message_start and its output in message_delta), so each side is kept apart and
+  // filled in whenever a frame carries it.
+  let inputTokens: number | null = null;
+  let outputTokens: number | null = null;
+  const takeUsage = (partial: PartialUsage | null): void => {
+    if (partial === null) return;
+    if (partial.input !== null) inputTokens = partial.input;
+    if (partial.output !== null) outputTokens = partial.output;
+  };
   let stop: string | null = null;
   if (!stream) {
     const value = jsonOrNull(bodyText);
     if (value === null) return { ok: false, status: 502, error: 'the provider answered a body that is not JSON' };
     const parsed = wire === 'openai' ? openAIText(value) : wire === 'anthropic' ? anthropicText(value) : geminiText(value);
     text = parsed.text;
-    usage = parsed.usage;
+    takeUsage(parsed.usage);
     stop = parsed.stop;
   } else {
     for (const frame of parseSse(bodyText)) {
@@ -293,11 +312,12 @@ async function readUpstream(res: Response, wire: 'openai' | 'anthropic' | 'gemin
       if (value === null) continue;
       const parsed = wire === 'openai' ? openAIText(value) : wire === 'anthropic' ? anthropicText(value) : geminiText(value);
       text += parsed.text;
-      if (parsed.usage !== null) usage = parsed.usage;
+      takeUsage(parsed.usage);
       if (parsed.stop !== null) stop = parsed.stop;
     }
   }
-  if (usage === null) return { ok: false, status: 502, error: 'the provider answered no usage' };
+  if (inputTokens === null || outputTokens === null) return { ok: false, status: 502, error: 'the provider answered no usage' };
+  const usage = { input: inputTokens, output: outputTokens };
   return { ok: true, status: 200, answer: { text, usage, stop: stop ?? 'stop' } };
 }
 
