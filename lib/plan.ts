@@ -140,6 +140,29 @@ export function buildPlan(brief: Brief, probes: readonly Probe[]): Map<string, C
   return plan;
 }
 
+/**
+ * The free-tier ceiling of each provider, from the brief's provider table: the largest
+ * budget a trial can draw for it. A provider's call number only ever rises, and a call past
+ * its budget always refuses, so once this many calls have been made to a provider no further
+ * call to it can succeed — the router stops spending calls there.
+ */
+const PROVIDER_CALL_CAP: Record<string, number> = {
+  groq: 12,
+  cerebras: 6,
+  gemini: 8,
+  zai: 5,
+  openrouter: 12,
+  sambanova: 5,
+  pollinations: 14,
+  cloudflare: 8,
+  ovh: 6,
+  kilol: 16,
+};
+
+function callCapOf(providerId: string): number {
+  return PROVIDER_CALL_CAP[providerId] ?? Number.POSITIVE_INFINITY;
+}
+
 /** What a provider call returned, in the router's terms: an answer, or a refusal to count. */
 export interface CallOutcome {
   ok: boolean;
@@ -153,6 +176,7 @@ export interface CallOutcome {
 export class Router {
   private consecutive = new Map<string, number>();
   private retired = new Set<string>();
+  private calls = new Map<string, number>();
 
   /** Providers retired so far, for the log. */
   retiredProviders(): string[] {
@@ -171,7 +195,10 @@ export class Router {
     for (const candidate of candidates) {
       const id = candidate.provider.id;
       if (this.retired.has(id) || tried.has(id)) continue;
+      // Past its ceiling a provider cannot answer: spend no call there.
+      if ((this.calls.get(id) ?? 0) >= callCapOf(id)) continue;
       tried.add(id);
+      this.calls.set(id, (this.calls.get(id) ?? 0) + 1);
       const outcome = await call(candidate);
       if (outcome.ok) {
         this.consecutive.set(id, 0);
@@ -184,7 +211,9 @@ export class Router {
     for (const candidate of candidates) {
       const id = candidate.provider.id;
       if (tried.has(id)) continue;
+      if ((this.calls.get(id) ?? 0) >= callCapOf(id)) continue;
       tried.add(id);
+      this.calls.set(id, (this.calls.get(id) ?? 0) + 1);
       const outcome = await call(candidate);
       if (outcome.ok) {
         this.consecutive.set(id, 0);
