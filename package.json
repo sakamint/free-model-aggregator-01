@@ -1,0 +1,1 @@
+{"description":"One server serving OpenAI- and Anthropic-compatible APIs, routing each request to the best free model across ten simulated free-tier providers, with failover when a provider refuses.","license":"MIT","main":"main.ts","name":"free-model-aggregator","type":"module","version":"1.0.0"}
