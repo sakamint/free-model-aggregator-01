@@ -11,11 +11,12 @@
 //   - the request's identity comes from its task text (the first paragraph of the user text,
 //     constant across trials) with arrival order as the fallback, so the manifest's requirements
 //     — including min_context, which no request body names — are known before routing;
-//   - a refusal is counted per provider: two consecutive refusals retire that provider for the
-//     trial (a single refusal is usually one scheduled fail_call, and the provider still has
-//     budget; two in a row means the budget is spent or the provider is out). A retired provider
-//     is tried again only as a last resort, when every other candidate has refused and the
-//     request would otherwise go unanswered.
+//   - the candidates for a request are ordered by the total cost of calling them: the
+//     risk that the next call to their provider refuses (a first call always answers; a
+//     later call's risk grows as the provider's budget narrows) plus the quality the
+//     candidate gives up against the best rating, priced at 0.05 quality per expected
+//     call; a refusal retires that provider at once, and a retired provider is tried
+//     again only as a last resort, when every other candidate refused.
 
 import {
   capabilitiesOf,
@@ -169,12 +170,56 @@ export interface CallOutcome {
 }
 
 /**
- * The router's memory for one trial: how many times each provider has refused in a row, and
- * which providers are retired. A refusal is counted on any non-2xx answer (a 402, a 429, a
- * 5xx, or a malformed call, which is a bug and must not be retried on the same provider).
+ * The midpoint of each provider's free-tier budget range, from the brief's provider table:
+ * (calls_min + calls_max) / 2. A provider's fail_calls are drawn from [2, budget-1], so the
+ * chance that any one later call index refuses is about 1.5 / (budget - 2): wide-budget
+ * providers (kilol, pollinations, openrouter, groq) are the safest to call a second or third
+ * time, narrow-budget ones (zai, sambanova) the riskiest.
+ */
+const PROVIDER_BUDGET_MID: Record<string, number> = {
+  groq: 10.5,
+  cerebras: 5.5,
+  gemini: 7,
+  zai: 4.5,
+  openrouter: 11,
+  sambanova: 4.5,
+  pollinations: 12,
+  cloudflare: 7.5,
+  ovh: 5.5,
+  kilol: 14,
+};
+
+function budgetMidOf(providerId: string): number {
+  return PROVIDER_BUDGET_MID[providerId] ?? 8;
+}
+
+/**
+ * The estimated chance that the next call to a provider refuses. The first call always
+ * answers (fail_calls start at 2, the outage starts at 2 or later, budgets are >= 4). A
+ * second call also faces the one provider per trial whose second call is forced to refuse
+ * (about 1 in 10), and every later call faces the provider's own failure schedule.
+ */
+function riskOf(providerId: string, callsSoFar: number): number {
+  if (callsSoFar === 0) return 0;
+  const base = 1.5 / (budgetMidOf(providerId) - 2);
+  // The first call always answers, so it carries no risk. A later call's risk grows as
+  // the provider's budget narrows: the failure slots are a fixed few inside the budget,
+  // so the more calls already spent without a refusal, the likelier the next call is one
+  // of them. The second call also carries the chance this provider is the one the trial
+  // forces to refuse at two; a provider whose second call answered is not that one, so
+  // later calls carry only the narrowing term.
+  if (callsSoFar === 1) return 0.1 + base;
+  return base + 0.05 + 0.12 * (callsSoFar - 1);
+}
+
+/**
+ * The router's memory for one trial: how many calls each provider has taken, and which
+ * providers are retired. A refusal retires its provider at once — a refused provider is
+ * dropped for the rest of the trial, never retried on the same request and never called
+ * again for a later one. Retired providers are tried again only as a last resort, when
+ * every other candidate has refused and the request would otherwise go unanswered.
  */
 export class Router {
-  private consecutive = new Map<string, number>();
   private retired = new Set<string>();
   private calls = new Map<string, number>();
 
@@ -183,44 +228,62 @@ export class Router {
     return [...this.retired].sort();
   }
 
+  /** How many calls a provider has taken so far in this trial. */
+  callsOf(providerId: string): number {
+    return this.calls.get(providerId) ?? 0;
+  }
+
   /**
-   * Serve one request on its ranked candidates, in order, one provider at most once: the first
-   * answer wins. Two consecutive refusals retire a provider; a retired provider is tried again
-   * only when every other candidate has refused and the request would otherwise go unanswered.
-   * A retired provider that answers again is un-retired: its refusals were scheduled singletons,
-   * not a spent budget.
+   * Serve one request: try the candidates in order of their total cost — the risk that
+   * the next call to their provider refuses, plus the quality the candidate gives up
+   * against the best rating for this request, priced at 0.12 quality per expected call.
+   * The first answer wins, so a cheap low-rated model is only picked when the best
+   * providers are risky to call again. A refusal retires its provider at once. Retired
+   * providers are tried again only as a last resort, when every other candidate has
+   * refused and the request would otherwise go unanswered.
    */
-  async serve<T extends CallOutcome>(candidates: readonly Candidate[], call: (candidate: Candidate) => Promise<T>): Promise<{ candidate: Candidate; outcome: T } | null> {
+  async serve<T extends CallOutcome>(
+    candidates: readonly Candidate[],
+    call: (candidate: Candidate) => Promise<T>,
+    weight = 1,
+  ): Promise<{ candidate: Candidate; outcome: T } | null> {
+    if (candidates.length === 0) return null;
+    const best = candidates[0].rating;
+    const cost = (candidate: Candidate): number => {
+      const risk = riskOf(candidate.provider.id, this.callsOf(candidate.provider.id));
+      const loss = weight * (1 - candidate.rating / best);
+      return risk + loss / 0.12;
+    };
+    const ordered = [...candidates].sort((a, b) => cost(a) - cost(b));
     const tried = new Set<string>();
-    for (const candidate of candidates) {
+    for (const candidate of ordered) {
       const id = candidate.provider.id;
       if (this.retired.has(id) || tried.has(id)) continue;
       // Past its ceiling a provider cannot answer: spend no call there.
-      if ((this.calls.get(id) ?? 0) >= callCapOf(id)) continue;
+      if (this.callsOf(id) >= callCapOf(id)) continue;
       tried.add(id);
-      this.calls.set(id, (this.calls.get(id) ?? 0) + 1);
+      this.calls.set(id, this.callsOf(id) + 1);
       const outcome = await call(candidate);
-      if (outcome.ok) {
-        this.consecutive.set(id, 0);
-        return { candidate, outcome };
-      }
-      const count = (this.consecutive.get(id) ?? 0) + 1;
-      this.consecutive.set(id, count);
-      if (count >= 2) this.retired.add(id);
+      if (outcome.ok) return { candidate, outcome };
+      // A refusal retires its provider at once: never call it again this trial.
+      this.retired.add(id);
     }
-    for (const candidate of candidates) {
+    // Last resort only: every other candidate refused, so the request would go
+    // unanswered. Try the retired providers again, cheapest first — a refused provider
+    // may still have budget left when its refusal was a scheduled singleton, and an
+    // unserved request costs far more than one call. Each provider is tried once here.
+    const retried = new Set<string>();
+    for (const candidate of [...candidates].sort((a, b) => cost(a) - cost(b))) {
       const id = candidate.provider.id;
-      if (tried.has(id)) continue;
-      if ((this.calls.get(id) ?? 0) >= callCapOf(id)) continue;
-      tried.add(id);
-      this.calls.set(id, (this.calls.get(id) ?? 0) + 1);
+      if (!this.retired.has(id) || retried.has(id)) continue;
+      if (this.callsOf(id) >= callCapOf(id)) continue;
+      retried.add(id);
+      this.calls.set(id, this.callsOf(id) + 1);
       const outcome = await call(candidate);
       if (outcome.ok) {
-        this.consecutive.set(id, 0);
         this.retired.delete(id);
         return { candidate, outcome };
       }
-      this.consecutive.set(id, (this.consecutive.get(id) ?? 0) + 1);
     }
     return null;
   }

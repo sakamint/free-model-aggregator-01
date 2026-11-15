@@ -175,7 +175,7 @@ async function serve(api: 'openai' | 'anthropic', body: Json, res: ServerRespons
     log(`${label}: no free model meets the request`);
     return sendError(res, api, 503, 'no_free_model', 'no free model on the directory meets this request');
   }
-  const served = await router.serve(candidates, (candidate) => callCandidate(candidate, canon));
+  const served = await router.serve(candidates, (candidate) => callCandidate(candidate, canon), entry?.weight ?? 1);
   if (served === null) {
     log(`${label}: every candidate refused (${upstreamCalls} upstream calls so far)`);
     return sendError(res, api, 502, 'upstream_unreachable', 'every provider that could serve this request refused it');
@@ -185,9 +185,14 @@ async function serve(api: 'openai' | 'anthropic', body: Json, res: ServerRespons
     log(`${label}: the router returned a refusal as an answer`);
     return sendError(res, api, 502, 'upstream_unreachable', 'every provider that could serve this request refused it');
   }
+  // The plan ranks candidates best-rated first, so candidates[0] is the best rating
+  // this request could have taken; the router may pick a cheaper one instead, and the
+  // quality it gives up is the price of saving that call.
+  const bestRating = candidates.length > 0 ? candidates[0].rating : candidate.rating;
+  const qualityGivenUp = bestRating > 0 ? (bestRating - candidate.rating) / bestRating : 0;
   log(
     `${label}: ${candidate.provider.id}/${candidate.model} rating ${candidate.rating}` +
-      ` (upstream call ${upstreamCalls}, retired: ${router.retiredProviders().join(',') || 'none'})`,
+      ` (quality given up ${(qualityGivenUp * 100).toFixed(1)}% vs best ${bestRating}, upstream call ${upstreamCalls}, retired: ${router.retiredProviders().join(',') || 'none'})`,
   );
   const answer = outcome.answer;
   if (api === 'openai') {
