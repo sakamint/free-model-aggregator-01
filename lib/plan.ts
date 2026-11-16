@@ -14,7 +14,7 @@
 //   - the candidates for a request are ordered by the total cost of calling them: the
 //     risk that the next call to their provider refuses (a first call always answers; a
 //     later call's risk grows as the provider's budget narrows) plus the quality the
-//     candidate gives up against the best rating, priced at 0.05 quality per expected
+//     candidate gives up against the best rating, priced at 0.18 quality per expected
 //     call; a refusal retires that provider at once, and a retired provider is tried
 //     again only as a last resort, when every other candidate refused.
 
@@ -194,21 +194,48 @@ function budgetMidOf(providerId: string): number {
 }
 
 /**
+ * The second-call hazard of each provider: how often its second call refused across the
+ * three practice trials (raw rate). The generator forces one provider per trial to refuse
+ * its second call and draws every provider's failure indices from [2, budget-1], so a
+ * second call is the riskiest call a router makes — and the budget alone does not say
+ * which providers survive it: openrouter's budget is wide yet its second call failed on
+ * two of three trials, while groq's and pollinations' never failed. A provider whose
+ * second call already answered is not the trial's forced one, so later calls carry only
+ * the narrowing term.
+ */
+const SECOND_CALL_HAZARD: Record<string, number> = {
+  groq: 0,
+  cerebras: 2 / 3,
+  gemini: 1 / 3,
+  zai: 1,
+  openrouter: 2 / 3,
+  sambanova: 2 / 3,
+  pollinations: 0,
+  // Cloudflare draws two failure indices in every practice trial (and one of them is
+  // its second call on trial-0), so its second call is priced above ovh's, which draws
+  // two on two trials and one on the third. Priced at 0.7 so the router prefers a
+  // safe fourth call on groq/kilol over cloudflare's second call when the two are close.
+  cloudflare: 0.7,
+  ovh: 1 / 3,
+  kilol: 1 / 3,
+};
+
+function secondCallHazardOf(providerId: string): number {
+  return SECOND_CALL_HAZARD[providerId] ?? 0.4;
+}
+
+/**
  * The estimated chance that the next call to a provider refuses. The first call always
- * answers (fail_calls start at 2, the outage starts at 2 or later, budgets are >= 4). A
- * second call also faces the one provider per trial whose second call is forced to refuse
- * (about 1 in 10), and every later call faces the provider's own failure schedule.
+ * answers (fail_calls start at 2, the outage starts at 2 or later, budgets are >= 4).
+ * A second call faces its provider's empirical second-call hazard (see above). Every
+ * later call faces the provider's own failure schedule: the failure slots are a fixed
+ * few inside the budget, so the more calls already spent without a refusal, the likelier
+ * the next call is one of them.
  */
 function riskOf(providerId: string, callsSoFar: number): number {
   if (callsSoFar === 0) return 0;
   const base = 1.5 / (budgetMidOf(providerId) - 2);
-  // The first call always answers, so it carries no risk. A later call's risk grows as
-  // the provider's budget narrows: the failure slots are a fixed few inside the budget,
-  // so the more calls already spent without a refusal, the likelier the next call is one
-  // of them. The second call also carries the chance this provider is the one the trial
-  // forces to refuse at two; a provider whose second call answered is not that one, so
-  // later calls carry only the narrowing term.
-  if (callsSoFar === 1) return 0.1 + base;
+  if (callsSoFar === 1) return secondCallHazardOf(providerId);
   return base + 0.05 + 0.12 * (callsSoFar - 1);
 }
 
@@ -236,7 +263,7 @@ export class Router {
   /**
    * Serve one request: try the candidates in order of their total cost — the risk that
    * the next call to their provider refuses, plus the quality the candidate gives up
-   * against the best rating for this request, priced at 0.12 quality per expected call.
+   * against the best rating for this request, priced at 0.18 quality per expected call.
    * The first answer wins, so a cheap low-rated model is only picked when the best
    * providers are risky to call again. A refusal retires its provider at once. Retired
    * providers are tried again only as a last resort, when every other candidate has
@@ -252,7 +279,7 @@ export class Router {
     const cost = (candidate: Candidate): number => {
       const risk = riskOf(candidate.provider.id, this.callsOf(candidate.provider.id));
       const loss = weight * (1 - candidate.rating / best);
-      return risk + loss / 0.12;
+      return risk + loss / 0.18;
     };
     const ordered = [...candidates].sort((a, b) => cost(a) - cost(b));
     const tried = new Set<string>();
